@@ -4,7 +4,6 @@ import tempfile
 import time
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple
 
 from dotenv import load_dotenv
 from github import Github
@@ -253,8 +252,7 @@ def main():
 
     if healed_result.success:
         pr_title = f"Self-healing fix (confidence {confidence})"
-        pr_body = f"""
-This pull request was generated automatically by the Self-Healing PR Agent.
+        pr_body = f"""This pull request was generated automatically by the Self-Healing PR Agent.
 
 - Initial tests: failing
 - After patch: all tests passing ✅
@@ -263,5 +261,17 @@ This pull request was generated automatically by the Self-Healing PR Agent.
 
 Traceback (before fix):
 
-```text
 {extract_error_snippet(initial_result, max_lines=40)}
+
+Logs (after fix):
+
+{healed_result.output[:1000]}
+"""
+        create_branch_and_pr(pr_title, pr_body)
+    else:
+        print("❌ Tests are still failing after patch. No PR created.")
+        print("You can inspect the changes manually now.")
+
+
+if __name__ == "__main__":
+    main()
