@@ -1,7 +1,7 @@
 import os
 import subprocess
-import tempfile
 import time
+import json
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -20,6 +20,9 @@ GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. "username/myrepo"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BASE_BRANCH = os.getenv("BASE_BRANCH", "main")
 MODEL_NAME = "gpt-4.1-mini"  # adjust as needed
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set in .env")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -86,25 +89,39 @@ def get_repo_code_snapshot(max_files: int = 10, max_chars_per_file: int = 2000) 
     return "\n\n".join(parts)
 
 
-# ---------- STEP 3: ASK LLM FOR PATCH (UNIFIED DIFF) ----------
+# ---------- STEP 3: ASK LLM FOR FIX (FULL FILE CONTENT) ----------
 
-def ask_llm_for_patch(error_snippet: str, code_snapshot: str) -> str:
+def ask_llm_for_fix(error_snippet: str, code_snapshot: str) -> tuple[str, str]:
     """
-    Ask the LLM to output a unified diff patch only.
+    Ask the LLM to return JSON with:
+    {
+      "filename": "relative/path/to/file.py",
+      "new_content": "<full corrected file content>"
+    }
     """
     system_prompt = """
-You are an expert software engineer.
-Given Python project files and a failing pytest traceback,
-you must FIX THE BUG by returning a UNIX unified diff patch.
+You are an expert Python developer helping to fix failing pytest tests.
+
+Given:
+- A Python project snapshot
+- The pytest traceback
+
+You must:
+1. Identify ONE most relevant Python source file that needs to be changed.
+2. Return the COMPLETE corrected content of that file.
 
 STRICT RULES:
-- Output ONLY a unified diff starting with lines like: diff --git a/... b/...
-- DO NOT write explanations, comments, or markdown.
-- Keep changes minimal and targeted.
-- Ensure syntax is valid and tests are more likely to pass.
+- Respond ONLY with valid JSON, no comments, no markdown.
+- JSON format must be exactly:
+  {
+    "filename": "relative/path/from/repo/root.py",
+    "new_content": "full corrected file content here"
+  }
+- "filename" must refer to an existing .py file in the repository snapshot.
+- "new_content" must be valid Python and include the entire file, not a diff.
 """
     user_prompt = f"""
-The tests in this repository are failing. Here is the traceback:
+The tests in this repository are failing. Here is the pytest traceback:
 
 <ERROR>
 {error_snippet}
@@ -116,10 +133,10 @@ Here is a snapshot of the repository code:
 {code_snapshot}
 </CODE>
 
-Return ONLY the unified diff patch to fix the problem.
+Return ONLY the JSON object as described. Do not add explanations.
 """
 
-    print("🤖 Calling LLM for patch...")
+    print("🤖 Calling LLM for full-file fix...")
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
@@ -129,45 +146,51 @@ Return ONLY the unified diff patch to fix the problem.
         temperature=0.2,
     )
 
-    patch_text = resp.choices[0].message.content.strip()
-    print("📦 Received patch from LLM (truncated preview):")
-    print("\n".join(patch_text.splitlines()[:15]), "\n...")
-    return patch_text
-
-
-# ---------- STEP 4: APPLY PATCH ----------
-
-def apply_patch(patch_text: str) -> bool:
-    """
-    Apply unified diff using `patch` command.
-    """
-    print("🩹 Applying patch...")
-    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
-        tmp.write(patch_text)
-        tmp_path = tmp.name
+    content = resp.choices[0].message.content.strip()
+    print("📦 Raw LLM JSON (truncated):")
+    print(content[:300], "...\n")
 
     try:
-        proc = subprocess.Popen(
-            ["patch", "-p1", "-i", tmp_path],
-            cwd=repo_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stdout, stderr = proc.communicate()
-        success = proc.returncode == 0
-        print(stdout)
-        if not success:
-            print("❌ Failed to apply patch:")
-            print(stderr)
-        else:
-            print("✅ Patch applied successfully")
-        return success
-    finally:
-        os.remove(tmp_path)
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        print("❌ Failed to parse LLM JSON:", e)
+        raise
+
+    filename = data["filename"]
+    new_content = data["new_content"]
+    return filename, new_content
 
 
-# ---------- STEP 5: CREATE BRANCH, COMMIT, PUSH & PR ----------
+# ---------- STEP 4: APPLY FIX (OVERWRITE FILE) ----------
+
+def apply_fix(filename: str, new_content: str) -> bool:
+    """
+    Overwrite the specified file with new_content.
+    """
+    target_path = repo_path / filename
+    print(f"📝 Applying fix to file: {filename}")
+
+    if not target_path.exists():
+        print(f"❌ File not found in repo: {filename}")
+        return False
+
+    try:
+        old_content = target_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"❌ Failed to read original file: {e}")
+        return False
+
+    try:
+        target_path.write_text(new_content, encoding="utf-8")
+    except Exception as e:
+        print(f"❌ Failed to write new file content: {e}")
+        return False
+
+    print("✅ File overwritten with new content")
+    return True
+
+
+# ---------- STEP 5: CONFIDENCE + GIT + PR ----------
 
 def compute_confidence_score(before_failed: bool, after_passed: bool, lines_changed: int) -> float:
     """
@@ -230,12 +253,16 @@ def main():
     error_snippet = extract_error_snippet(initial_result)
     code_snapshot = get_repo_code_snapshot()
 
-    # 2. Get patch from LLM
-    patch_text = ask_llm_for_patch(error_snippet, code_snapshot)
+    # 2. Get full-file fix from LLM
+    try:
+        filename, new_content = ask_llm_for_fix(error_snippet, code_snapshot)
+    except Exception:
+        print("💔 Stopping: LLM did not return valid JSON.")
+        return
 
-    # 3. Apply patch
-    if not apply_patch(patch_text):
-        print("💔 Stopping: patch failed to apply.")
+    # 3. Apply fix
+    if not apply_fix(filename, new_content):
+        print("💔 Stopping: failed to apply fix.")
         return
 
     # 4. Run tests again
@@ -269,7 +296,7 @@ Logs (after fix):
 """
         create_branch_and_pr(pr_title, pr_body)
     else:
-        print("❌ Tests are still failing after patch. No PR created.")
+        print("❌ Tests are still failing after fix. No PR created.")
         print("You can inspect the changes manually now.")
 
 
